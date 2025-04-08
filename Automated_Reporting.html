@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Property Map & Report Export</title>
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <!-- Custom style for form -->
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; }
+    #map { height: 100%; }
+    .search-form {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 1000;
+      background-color: rgba(255, 255, 255, 0.85);
+      padding: 15px;
+      border-radius: 8px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+      width: 300px;
+      font-family: Arial, sans-serif;
+    }
+    .search-form h2 { margin-top: 0; font-size: 1.25em; }
+    .search-form label { display: block; margin-bottom: 5px; font-weight: bold; }
+    .search-form input {
+      width: 100%; margin-bottom: 10px; padding: 8px;
+      border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;
+    }
+    .search-form button {
+      width: 100%; padding: 10px; border: none; border-radius: 4px;
+      background-color: #28a745; color: #fff; font-size: 1em; cursor: pointer;
+      margin-bottom: 8px;
+    }
+    .search-form button:hover { background-color: #218838; }
+  </style>
+
+  <!-- Include Proj4js for coordinate transformations -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.8.0/proj4.js"></script>
+  <!-- Define projections -->
+  <script>
+    // Define EPSG:4167 (source) and EPSG:2193 (destination)
+    proj4.defs("EPSG:4167", "+proj=longlat +datum=NZGD2000 +no_defs");
+    proj4.defs("EPSG:2193", "+proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +datum=NZGD2000 +units=m +no_defs");
+  </script>
+
+  <!-- Include PizZip (for Docxtemplater) -->
+  <script src="https://cdn.jsdelivr.net/npm/pizzip@3.1.8/dist/pizzip.min.js"></script>
+  <!-- Include Docxtemplater -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/docxtemplater/3.21.1/docxtemplater.js"></script>
+  <!-- Include FileSaver for saving files -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+  <!-- Include Leaflet JS -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="search-form">
+    <h2>Search Property</h2>
+    <form id="propertyForm">
+      <label for="propertyAddress">Property Address:</label>
+      <!-- Use a simple key placeholder in your template (e.g. {{propertyAddress}}) -->
+      <input type="text" id="propertyAddress" name="propertyAddress" required>
+      
+      <label for="legalDescription">Legal Description:</label>
+      <input type="text" id="legalDescription" name="legalDescription" required>
+      
+      <label for="territorialAuthority">Territorial Authority:</label>
+      <input type="text" id="territorialAuthority" name="territorialAuthority" required>
+      
+      <label for="limReferenceNumber">LIM Reference Number:</label>
+      <input type="text" id="limReferenceNumber" name="limReferenceNumber" required>
+      
+      <button type="submit">Search</button>
+      <button type="button" id="exportReport">Export Report</button>
+    </form>
+  </div>
+
+  <script>
+    // Initialize the map (Leaflet uses EPSG:3857 for display)
+    var map = L.map('map').setView([-41.2865, 174.7762], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    // Global variables for the property layer and hazard query results.
+    var propertyLayer = null;
+    var hazardInfo = {};
+
+    // Form event listeners.
+    document.getElementById('propertyForm').addEventListener('submit', function(e) {
+      e.preventDefault();
+      searchProperty();
+    });
+    document.getElementById('exportReport').addEventListener('click', function() {
+      exportReport();
+    });
+
+    // Transform a GeoJSON geometry from one CRS to another.
+    // Supports "Polygon" and "MultiPolygon" types.
+    function transformGeometry(geojsonGeometry, fromCRS, toCRS) {
+      if (geojsonGeometry.type === "Polygon") {
+        return {
+          type: "Polygon",
+          coordinates: geojsonGeometry.coordinates.map(ring =>
+            ring.map(coord => {
+              if (typeof coord[0] !== 'number' || typeof coord[1] !== 'number') {
+                console.error("Invalid coordinate encountered:", coord);
+              }
+              return proj4(fromCRS, toCRS, coord);
+            })
+          )
+        };
+      } else if (geojsonGeometry.type === "MultiPolygon") {
+        return {
+          type: "MultiPolygon",
+          coordinates: geojsonGeometry.coordinates.map(polygon =>
+            polygon.map(ring =>
+              ring.map(coord => {
+                if (typeof coord[0] !== 'number' || typeof coord[1] !== 'number') {
+                  console.error("Invalid coordinate encountered:", coord);
+                }
+                return proj4(fromCRS, toCRS, coord);
+              })
+            )
+          )
+        };
+      } else {
+        console.error("Unsupported geometry type:", geojsonGeometry.type);
+        return geojsonGeometry;
+      }
+    }
+
+    // Convert a (transformed) GeoJSON Polygon into ESRI JSON format.
+    // If the geometry is a MultiPolygon, take the first polygon.
+    function convertGeoJSONToEsri(geojson) {
+      if (geojson.type === 'Polygon') {
+        return {
+          rings: geojson.coordinates,
+          spatialReference: { wkid: 2193 }
+        };
+      } else if (geojson.type === 'MultiPolygon') {
+        return {
+          rings: geojson.coordinates[0],
+          spatialReference: { wkid: 2193 }
+        };
+      }
+      return null;
+    }
+
+    // Search for the property using the LINZ WFS service (EPSG:4167).
+    function searchProperty() {
+      const propertyAddress = document.getElementById('propertyAddress').value;
+      // Build the OGC filter query.
+      var filter = '<Filter xmlns="http://www.opengis.net/ogc">' +
+                   '<PropertyIsEqualTo>' +
+                     '<PropertyName>appellation</PropertyName>' +
+                     '<Literal>' + propertyAddress + '</Literal>' +
+                   '</PropertyIsEqualTo>' +
+                   '</Filter>';
+      var encodedFilter = encodeURIComponent(filter);
+      var wfsUrl = 'https://data.linz.govt.nz/services;key=578da806e5dc4edda31909f73f7d178a/wfs/layer-50772?' +
+                   'service=WFS&request=GetFeature&version=1.1.0&typeName=layer-50772&outputFormat=application/json&filter=' + encodedFilter;
+
+      fetch(wfsUrl)
+        .then(response => {
+          if (!response.ok) {
+            throw new Error('Network response was not ok.');
+          }
+          return response.json();
+        })
+        .then(data => {
+          if (!data.features || data.features.length === 0) {
+            alert('No property found with the specified address.');
+            return;
+          }
+          // Use the first returned feature.
+          var feature = data.features[0];
+
+          // Remove any existing property layer.
+          if (propertyLayer) {
+            map.removeLayer(propertyLayer);
+          }
+
+          // Add the property feature to the map using its original geometry.
+          propertyLayer = L.geoJSON(feature, {
+            onEachFeature: function(feature, layer) {
+              var popupContent =
+                '<b>Appellation:</b> ' + feature.properties.appellation + '<br/>' +
+                '<b>Affected Surveys:</b> ' + feature.properties.affected_surveys + '<br/>' +
+                '<b>Parcel Intent:</b> ' + feature.properties.parcel_intent + '<br/>' +
+                '<b>Topology Type:</b> ' + feature.properties.topology_type + '<br/>' +
+                '<b>Statutory Actions:</b> ' + feature.properties.statutory_actions + '<br/>' +
+                '<b>Land District:</b> ' + feature.properties.land_district + '<br/>' +
+                '<b>Titles:</b> ' + feature.properties.titles + '<br/>' +
+                '<b>Survey Area:</b> ' + feature.properties.survey_area + '<br/>' +
+                '<b>Calculated Area:</b> ' + feature.properties.calc_area;
+              layer.bindPopup(popupContent);
+            }
+          }).addTo(map);
+          map.fitBounds(propertyLayer.getBounds());
+
+          // Transform the property geometry to EPSG:2193 for hazard queries.
+          var transformedGeoJSON = transformGeometry(feature.geometry, "EPSG:4167", "EPSG:2193");
+
+          // Query hazard layers using the transformed geometry.
+          Promise.all([
+            queryFloodLayer(transformedGeoJSON),
+            queryEvacuationLayer(transformedGeoJSON)
+          ])
+          .then(function(results) {
+            hazardInfo.flood = results[0];  // Floodplain layer (ID: 7)
+            hazardInfo.evac = results[1];     // Tsunami Evacuation Zones (ID: 8)
+          });
+        })
+        .catch(error => {
+          console.error('Error querying WFS service:', error);
+          alert('An error occurred while fetching the property data.');
+        });
+    }
+
+    // Query the Floodplain layer (Layer ID: 7) for intersections.
+    function queryFloodLayer(geojsonGeometry) {
+      const esriGeometry = convertGeoJSONToEsri(geojsonGeometry);
+      const url = 'https://maps.es.govt.nz/server/rest/services/Public/NaturalHazards/MapServer/7/query';
+      const params = new URLSearchParams({
+        geometry: JSON.stringify(esriGeometry),
+        geometryType: 'esriGeometryPolygon',
+        spatialRel: 'esriSpatialRelIntersects',
+        inSR: 2193,
+        outFields: 'Region',
+        f: 'json'
+      });
+      return fetch(url + '?' + params.toString())
+        .then(response => response.json())
+        .catch(err => {
+          console.error('Error querying Floodplain layer:', err);
+          return null;
+        });
+    }
+
+    // Query the Tsunami Evacuation Zones layer (Layer ID: 8) for intersections.
+    function queryEvacuationLayer(geojsonGeometry) {
+      const esriGeometry = convertGeoJSONToEsri(geojsonGeometry);
+      const url = 'https://maps.es.govt.nz/server/rest/services/Public/NaturalHazards/MapServer/8/query';
+      const params = new URLSearchParams({
+        geometry: JSON.stringify(esriGeometry),
+        geometryType: 'esriGeometryPolygon',
+        spatialRel: 'esriSpatialRelIntersects',
+        inSR: 2193,
+        outFields: 'Zone,ZoneText',
+        f: 'json'
+      });
+      return fetch(url + '?' + params.toString())
+        .then(response => response.json())
+        .catch(err => {
+          console.error('Error querying Evacuation Zone layer:', err);
+          return null;
+        });
+    }
+
+    // Export the edited Word document report.
+    function exportReport() {
+      // Retrieve form values.
+      const propertyAddress = document.getElementById('propertyAddress').value;
+      const legalDescription = document.getElementById('legalDescription').value;
+      const territorialAuthority = document.getElementById('territorialAuthority').value;
+      const limReferenceNumber = document.getElementById('limReferenceNumber').value;
+      
+      // Format today's date.
+      const today = new Date();
+      const formattedDate = today.toLocaleDateString();
+      console.log(hazardInfo.flood)
+      // Hazard messages based on query results.
+      var floodingMessage = "Property is NOT located within an actual and potential floodplain.";
+      var floodingRegion = "";
+      if (hazardInfo.flood && hazardInfo.flood.features && hazardInfo.flood.features.length > 0) {
+        floodingMessage = "Property is located within an actual and potential floodplain.";
+        console.log(hazardInfo.flood.features);
+        
+        floodingRegion = hazardInfo.flood.features[0].attributes.Region || "";
+      }
+      
+      var evacuationZoneMessage = "";
+      var zoneText = "";
+      if (hazardInfo.evac && hazardInfo.evac.features && hazardInfo.evac.features.length > 0) {
+        const zone = hazardInfo.evac.features[0].attributes.Zone || "";
+        evacuationZoneMessage = "Property is located within the " + zone + " zone";
+        zoneText = hazardInfo.evac.features[0].attributes.ZoneText || "";
+      }
+      
+      // Load and process the Word template file.
+      // The template must have simple placeholders (e.g., {{propertyAddress}}, {{legalDescription}}, etc.)
+      fetch('Report.docx')
+        .then(response => response.arrayBuffer())
+        .then(arrayBuffer => {
+          const zip = new PizZip(arrayBuffer);
+          const doc = new docxtemplater(zip);
+          doc.setData({
+            propertyAddress: propertyAddress,
+            legalDescription: legalDescription,
+            territorialAuthority: territorialAuthority,
+            limReferenceNumber: limReferenceNumber,
+            date: formattedDate,
+            floodingMessage: floodingMessage,
+            floodingRegion: floodingRegion,
+            evacuationZoneMessage: evacuationZoneMessage,
+            zoneText: zoneText
+          });
+          try {
+            doc.render();
+          } catch (error) {
+            console.error('Error rendering document template:', error);
+            alert('Error processing the document template.');
+            return;
+          }
+          const out = doc.getZip().generate({ type: "blob" });
+          saveAs(out, propertyAddress + "_Report.docx");
+        })
+        .catch(err => {
+          console.error('Error loading template file:', err);
+          alert("Error loading the document template.");
+        });
+    }
+  </script>
+</body>
+</html>
